@@ -23,7 +23,12 @@ impl SlideApp {
         let Ok(v) = self.session.execute(cmd, &json!({})) else { return };
         let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
         let html = v.get("html").and_then(Value::as_str).unwrap_or("").to_string();
-        if self.session.clipboard.slides.is_empty() && !html.is_empty() && self.services.clipboard_set_html.as_mut().is_some_and(|f| f(&html, &text))
+        // HTML only with words to go with it: an empty text box would leave empty plain text, and
+        // egui-winit drops Ctrl+V when the clipboard text is empty, so it gets the marker instead.
+        if self.session.clipboard.slides.is_empty()
+            && !html.is_empty()
+            && !text.is_empty()
+            && self.services.clipboard_set_html.as_mut().is_some_and(|f| f(&html, &text))
         {
             return;
         }

@@ -2339,3 +2339,44 @@ fn overdue_visible_logic_does_not_reanchor_a_later_hidden_show() {
     let _ = ctx.run_logic(&raw_at(12.0, true, false), |ctx| app.tick_hidden_show(ctx, visible_anchor + std::time::Duration::from_secs(3)));
     assert_eq!(app.show.as_ref().unwrap().state.slide, 1, "time from the full visible frame is preserved through the logic-only pass");
 }
+
+/// An empty text box went out as HTML with empty plain text, so egui-winit dropped Ctrl+V and
+/// the shortcut pasted nothing (the context menu worked). It now leaves the marker like any
+/// object without words.
+#[test]
+fn copy_then_paste_shortcut_duplicates_an_empty_text_box() {
+    let html_calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(String, String)>::new()));
+    let seen = html_calls.clone();
+    let services = Services {
+        // A host that takes HTML, as the desktop app does.
+        clipboard_set_html: Some(Box::new(move |h: &str, t: &str| {
+            seen.borrow_mut().push((h.to_string(), t.to_string()));
+            true
+        })),
+        ..Default::default()
+    };
+    let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+        |ui, app: &mut SlideApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        SlideApp::new(Session::with_new(), services),
+    );
+    harness.run_steps(2);
+    harness.state_mut().session.execute("insert.textBox", &json!({"rect": [600, 380, 220, 80], "text": ""})).unwrap();
+    let count = |h: &egui_kittest::Harness<'_, SlideApp>| h.state().session.doc().unwrap().current_slide().unwrap().shapes.len();
+    let before = count(&harness);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(2);
+    assert!(html_calls.borrow().is_empty(), "no HTML without words: {:?}", html_calls.borrow());
+    harness.event(egui::Event::Paste(OBJECTS_MARKER.to_string()));
+    harness.run_steps(2);
+    assert_eq!(count(&harness), before + 1, "the shortcut pastes a copy of the empty text box");
+    // Words still go out as HTML.
+    let id =
+        harness.state_mut().session.execute("insert.textBox", &json!({"rect": [100, 100, 200, 60], "text": "Hi"})).unwrap()["id"].as_u64().unwrap();
+    harness.state_mut().session.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    harness.event(egui::Event::Copy);
+    harness.run_steps(2);
+    assert_eq!(html_calls.borrow().last().map(|(_, t)| t.as_str()), Some("Hi"));
+}
