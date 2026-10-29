@@ -75,6 +75,9 @@ fn slides_scope(s: &Session, p: &Value) -> bool {
         || s.active().is_some_and(|d| d.selection.shapes.is_empty() && d.selection.text.is_none() && !d.selection.slides.is_empty())
 }
 
+/// Copy the selection (a text range, slides, or shapes) onto the session clipboard and return its
+/// plain text. With only a caret, `whole_shape_at_caret` decides whether the caret's shape is copied
+/// (Copy) or nothing is (Cut); an empty answer leaves the clipboard untouched.
 fn copy_inner(s: &mut Session, p: &Value, whole_shape_at_caret: bool) -> Result<String> {
     let st = s.doc()?;
     // Text selection.
@@ -132,6 +135,7 @@ fn copy_inner(s: &mut Session, p: &Value, whole_shape_at_caret: bool) -> Result<
     Ok(plain)
 }
 
+/// Whether the text selection is only a caret (no range) in the active document.
 fn copying_caret(s: &Session) -> bool {
     s.active().is_some_and(|d| d.selection.text.as_ref().is_some_and(|t| !t.is_range()))
 }
@@ -142,6 +146,8 @@ fn caret_copies_shape(sel: &crate::Selection, t: &crate::TextSel) -> bool {
     !t.is_range() && !t.notes && t.cell.is_none() && sel.shapes.contains(&t.shape)
 }
 
+/// `edit.copy`: the plain text and HTML to offer on the system clipboard. A caret that copies
+/// nothing (the notes, a table cell) answers with empty strings so the previous clipboard never leaks.
 fn copy(s: &mut Session, p: &Value) -> Result<Value> {
     // A caret copies its whole shape; where it copies nothing (the notes, a table cell) the
     // previous clipboard must not leak into this answer.
@@ -168,6 +174,8 @@ fn copied_html(s: &Session) -> String {
     richclip::body_to_html(&TextBody { paragraphs, ..Default::default() })
 }
 
+/// `edit.cut`: copy, then delete what was copied. With only a caret nothing was copied, so
+/// nothing is deleted.
 fn cut(s: &mut Session, p: &Value) -> Result<Value> {
     let caret = copying_caret(s);
     let t = copy_inner(s, p, false)?;
@@ -274,6 +282,9 @@ fn bring_media(cmd: &str, doc: &mut deckcraft_model::Presentation, media: &[deck
     Ok(map)
 }
 
+/// `edit.paste`: external text or HTML (`text`, `html` params) into the text being edited, else
+/// the session clipboard: text into an edit, slides after the current one, or shapes onto the slide.
+/// The shape a caret-only Copy took is pasted as a copy, not as words into its own text.
 fn paste(s: &mut Session, p: &Value) -> Result<Value> {
     // External plain text (from the system clipboard) wins when given and differs from ours.
     // HTML from Pages or Keynote keeps bold, italic and underline when it says the same words.
