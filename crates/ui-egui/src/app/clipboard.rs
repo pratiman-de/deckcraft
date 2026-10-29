@@ -38,7 +38,7 @@ impl SlideApp {
 
 /// Whether pasted plain text is SVG markup: what vector apps (VectorCraft, Illustrator, Inkscape,
 /// Figma…) put on the clipboard as a copy's plain text, next to a small picture of it.
-pub(super) fn is_svg_markup(text: &str) -> bool {
+fn is_svg_markup(text: &str) -> bool {
     let t = text.trim_start_matches('\u{feff}').trim();
     (t.starts_with("<?xml") || t.starts_with("<svg") || t.starts_with("<!DOCTYPE svg")) && t.contains("<svg") && t.ends_with("</svg>")
 }
@@ -80,10 +80,37 @@ pub(super) fn svg_size(svg: &str) -> Option<(f64, f64)> {
 }
 
 impl SlideApp {
+    /// Handle pasted plain text that is SVG markup from another app: `true` when it was dealt with
+    /// (a picture inserted, or an error shown), `false` when it should go on to the ordinary text
+    /// paste. Our own copy (a shape whose words happen to be markup) stays with `edit.paste`, and a
+    /// host that can neither render SVG nor read a clipboard picture pastes the markup as text.
+    pub(super) fn paste_svg_text(&mut self, ctx: &egui::Context, text: &str) -> bool {
+        if !is_svg_markup(text) || self.session.clipboard.plain == text {
+            return false;
+        }
+        let revision = self.session.active().map(|d| d.revision);
+        let handled = match self.paste_svg(text) {
+            Ok(done) => done,
+            Err(e) => {
+                self.set_status(e);
+                true
+            }
+        };
+        if self.session.active().map(|d| d.revision) != revision {
+            self.note_application_edit(ctx);
+        }
+        handled
+    }
+
     /// Paste SVG markup from another app as one picture centred on the slide, at the drawing's size
     /// in points (scaled down to fit the slide). Sharp when the host renders SVG
     /// (`Services::clipboard_svg`), else the picture the other app put on the clipboard with it.
-    pub(super) fn paste_svg(&mut self, svg: &str) -> Result<(), String> {
+    /// `Ok(false)` when the host can do neither (the web build), so the caller pastes the markup
+    /// as ordinary text instead.
+    pub(super) fn paste_svg(&mut self, svg: &str) -> Result<bool, String> {
+        if self.services.clipboard_svg.is_none() && self.services.clipboard_image.is_none() {
+            return Ok(false);
+        }
         let (png, (w, h)) = match self.services.clipboard_svg.as_mut().and_then(|f| f(svg)) {
             Some((png, w, h)) => (png, svg_size(svg).unwrap_or((w, h))),
             None => {
@@ -91,7 +118,7 @@ impl SlideApp {
                 (png, svg_size(svg).ok_or("Couldn't read the copied drawing's size")?)
             }
         };
-        let Some(d) = self.session.active() else { return Ok(()) };
+        let Some(d) = self.session.active() else { return Ok(true) };
         let (sw, sh) = (d.doc.slide_size.width, d.doc.slide_size.height);
         let fit = (sw / w).min(sh / h).min(1.0);
         let (w, h) = (w * fit, h * fit);
@@ -99,7 +126,7 @@ impl SlideApp {
         let data = deckcraft_engine::cmd::base64_encode(&png);
         self.session
             .execute("insert.picture", &json!({"name": "Pasted drawing.png", "data": data, "rect": rect}))
-            .map(|_| ())
+            .map(|_| true)
             .map_err(|e| e.to_string())
     }
 }

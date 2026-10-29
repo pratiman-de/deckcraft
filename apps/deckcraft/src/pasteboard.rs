@@ -35,21 +35,34 @@ pub fn image_png() -> Option<Vec<u8>> {
 const SVG_PIXELS_PER_POINT: f64 = 4.0;
 /// Longest side of a pasted drawing's picture, so a huge one stays a sane size.
 const SVG_MAX_SIDE: f64 = 8192.0;
+/// Most pixels a pasted drawing is rendered to: 16 megapixels, the same bound as a pasted
+/// clipboard image, so a large drawing can't exhaust memory on its way to `insert.picture`.
+const SVG_MAX_PIXELS: f64 = 16_000_000.0;
 
-/// SVG markup rendered to PNG bytes at [`SVG_PIXELS_PER_POINT`], with its size in points.
+/// SVG markup rendered to PNG bytes at up to [`SVG_PIXELS_PER_POINT`], with its size in points.
 ///
 /// Vector apps (VectorCraft, Illustrator, Inkscape, Figma…) put a copy's SVG markup on the
 /// clipboard as its plain text, next to a small 1 px-per-point picture; rendering the markup keeps
 /// a pasted drawing sharp. `None` when the markup doesn't parse or has no size.
 pub fn svg_png(svg: &str) -> Option<(Vec<u8>, f64, f64)> {
-    let mut options = resvg::usvg::Options::default();
+    let mut options = resvg::usvg::Options {
+        // Sizes come back in points: `width="1in"` is 72, not usvg's 96-dpi default.
+        dpi: 72.0,
+        // Pasted markup is untrusted: an `<image href="…">` must never read a local file, which
+        // usvg's default resolver does. Data URLs still work; any other reference resolves to nothing.
+        image_href_resolver: resvg::usvg::ImageHrefResolver {
+            resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    };
     options.fontdb_mut().load_system_fonts();
     let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
     let (w, h) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
     if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
         return None;
     }
-    let scale = SVG_PIXELS_PER_POINT.min(SVG_MAX_SIDE / w.max(h));
+    let scale = SVG_PIXELS_PER_POINT.min(SVG_MAX_SIDE / w.max(h)).min((SVG_MAX_PIXELS / (w * h)).sqrt());
     let mut pixmap = resvg::tiny_skia::Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32)?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale as f32, scale as f32), &mut pixmap.as_mut());
     Some((pixmap.encode_png().ok()?, w, h))
@@ -71,6 +84,24 @@ mod tests {
         let p = img.get_pixel(40, 20);
         assert!(p[0] > 200 && p[1] < 40 && p[3] > 200, "{p:?}");
         assert!(super::svg_png("not svg").is_none());
+    }
+
+    /// A drawing past the pixel budget renders below 4 px per point, sizes in inches come back
+    /// in points, and an `<image>` pointing at a local file draws nothing.
+    #[test]
+    fn svg_render_is_bounded_and_in_points() {
+        let big = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="4000"><rect width="4000" height="4000" fill="#00ff00"/></svg>"##;
+        let (png, w, h) = super::svg_png(big).expect("render");
+        assert_eq!((w, h), (4000.0, 4000.0));
+        let (pw, ph) = image::load_from_memory(&png).expect("decode").to_rgba8().dimensions();
+        assert!(u64::from(pw) * u64::from(ph) <= 16_000_000, "{pw}x{ph}");
+        let inch = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="0.5in"><rect width="100%" height="100%" fill="#0000ff"/></svg>"##;
+        let (_, w, h) = super::svg_png(inch).expect("render");
+        assert_eq!((w, h), (72.0, 36.0));
+        let file = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4" height="4"><image xlink:href="C:/Windows/notepad.exe" width="4" height="4"/></svg>"##;
+        let (png, _, _) = super::svg_png(file).expect("render");
+        let img = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(img.get_pixel(8, 8)[3], 0, "nothing drawn from a local path");
     }
 
     /// Puts HTML and a 1×1 picture on the macOS pasteboard and reads them back.

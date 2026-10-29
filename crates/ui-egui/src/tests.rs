@@ -2422,3 +2422,59 @@ fn copy_then_paste_shortcut_duplicates_an_empty_text_box() {
     harness.run_steps(2);
     assert_eq!(html_calls.borrow().last().map(|(_, t)| t.as_str()), Some("Hi"));
 }
+
+/// A host with neither an SVG renderer nor a clipboard image (the web build) pastes SVG markup
+/// as ordinary text, so nothing is lost: the shape is a text box, not a picture.
+#[test]
+fn pasting_svg_markup_without_clipboard_services_pastes_text() {
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
+    let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+        |ui, app: &mut SlideApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        SlideApp::new(Session::with_new(), Services::default()),
+    );
+    harness.run_steps(2);
+    let before = harness.state().session.active().unwrap().doc.slides[0].shapes.len();
+    harness.event(egui::Event::Paste(svg.into()));
+    harness.run_steps(2);
+    let d = harness.state().session.active().unwrap();
+    let shapes = &d.doc.slides[0].shapes;
+    assert_eq!(shapes.len(), before + 1, "one new shape");
+    let pasted = shapes.last().unwrap();
+    assert!(!matches!(pasted.kind, deckcraft_model::ShapeKind::Picture { .. }), "not a picture");
+    assert!(pasted.text.as_ref().is_some_and(|t| t.text().contains("<svg")), "the markup as text: {:?}", pasted.text);
+}
+
+/// A text box whose words are SVG markup, copied here and pasted here, is duplicated as a shape
+/// through the session clipboard; it is not re-read as a drawing from another app.
+#[test]
+fn own_copy_of_markup_text_pastes_as_the_shape() {
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>";
+    let image = Session::with_new().active().map(|d| deckcraft_engine::cmd::file::render_png(&d.doc, 0, 0.1, false).0).unwrap();
+    let services = Services { clipboard_image: Some(Box::new(move || Some(image.clone()))), ..Default::default() };
+    let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+        |ui, app: &mut SlideApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        SlideApp::new(Session::with_new(), services),
+    );
+    harness.run_steps(2);
+    let id =
+        harness.state_mut().session.execute("insert.textBox", &json!({"rect": [100, 100, 400, 60], "text": svg})).unwrap()["id"].as_u64().unwrap();
+    harness.state_mut().session.execute("edit.select", &json!({"ids": [id]})).unwrap();
+    let count = |h: &egui_kittest::Harness<'_, SlideApp>| h.state().session.doc().unwrap().current_slide().unwrap().shapes.len();
+    let before = count(&harness);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(2);
+    assert_eq!(harness.state().session.clipboard.plain, svg, "the copy's plain text is the markup");
+    harness.event(egui::Event::Paste(svg.into()));
+    harness.run_steps(2);
+    assert_eq!(count(&harness), before + 1, "one new shape");
+    let d = harness.state().session.active().unwrap();
+    let pasted = d.doc.slides[0].shapes.last().unwrap();
+    assert!(!matches!(pasted.kind, deckcraft_model::ShapeKind::Picture { .. }), "a copy of the text box, not a picture");
+    assert!(pasted.text.as_ref().is_some_and(|t| t.text() == svg), "{:?}", pasted.text);
+}
