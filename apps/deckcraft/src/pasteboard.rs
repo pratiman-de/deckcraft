@@ -1,4 +1,5 @@
-//! System pasteboard: HTML rich text, and a picture (TIFF on macOS, via arboard).
+//! System pasteboard: HTML rich text, a picture (TIFF on macOS, via arboard), and SVG markup from
+//! vector apps rendered to a picture (via resvg).
 //!
 //! Pages keeps bold, italic and underline when the pasteboard carries HTML plus the same plain
 //! words. A shape with no text is copied as an image by the UI; this module only reads a picture
@@ -30,9 +31,47 @@ pub fn image_png() -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Pixels per point for a pasted drawing: sharp on a 4K screen.
+const SVG_PIXELS_PER_POINT: f64 = 4.0;
+/// Longest side of a pasted drawing's picture, so a huge one stays a sane size.
+const SVG_MAX_SIDE: f64 = 8192.0;
+
+/// SVG markup rendered to PNG bytes at [`SVG_PIXELS_PER_POINT`], with its size in points.
+///
+/// Vector apps (VectorCraft, Illustrator, Inkscape, Figma…) put a copy's SVG markup on the
+/// clipboard as its plain text, next to a small 1 px-per-point picture; rendering the markup keeps
+/// a pasted drawing sharp. `None` when the markup doesn't parse or has no size.
+pub fn svg_png(svg: &str) -> Option<(Vec<u8>, f64, f64)> {
+    let mut options = resvg::usvg::Options::default();
+    options.fontdb_mut().load_system_fonts();
+    let tree = resvg::usvg::Tree::from_str(svg, &options).ok()?;
+    let (w, h) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
+    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+        return None;
+    }
+    let scale = SVG_PIXELS_PER_POINT.min(SVG_MAX_SIDE / w.max(h));
+    let mut pixmap = resvg::tiny_skia::Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale as f32, scale as f32), &mut pixmap.as_mut());
+    Some((pixmap.encode_png().ok()?, w, h))
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+
+    /// A pasted drawing renders at 4 px per point and keeps its size in points; text that isn't
+    /// SVG gives nothing.
+    #[test]
+    fn svg_markup_renders_sharp_with_its_size() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#ff0000"/></svg>"##;
+        let (png, w, h) = super::svg_png(svg).expect("render");
+        assert_eq!((w, h), (20.0, 10.0));
+        let img = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(img.dimensions(), (80, 40));
+        let p = img.get_pixel(40, 20);
+        assert!(p[0] > 200 && p[1] < 40 && p[3] > 200, "{p:?}");
+        assert!(super::svg_png("not svg").is_none());
+    }
 
     /// Puts HTML and a 1×1 picture on the macOS pasteboard and reads them back.
     /// Restores whatever plain text was there. Other platforms return immediately.

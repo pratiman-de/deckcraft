@@ -1,4 +1,4 @@
-use super::clipboard::OBJECTS_MARKER;
+use super::clipboard::{OBJECTS_MARKER, is_svg_markup};
 use super::{Mods, SlideApp, Value, backstage, json, menus};
 
 impl SlideApp {
@@ -148,6 +148,18 @@ impl SlideApp {
                 egui::Event::Paste(text) => {
                     // Our own marker for objects without text: paste what the session copied.
                     let text = if text == OBJECTS_MARKER { String::new() } else { text };
+                    // Vector art copied in another app (VectorCraft, Illustrator, Inkscape…) comes as
+                    // SVG markup in the plain text: it lands as a picture, not as a text box of markup.
+                    if is_svg_markup(&text) {
+                        let revision = self.session.active().map(|d| d.revision);
+                        if let Err(e) = self.paste_svg(&text) {
+                            self.set_status(e);
+                        }
+                        if self.session.active().map(|d| d.revision) != revision {
+                            self.note_application_edit(ctx);
+                        }
+                        continue;
+                    }
                     // A picture (TIFF from Keynote, a screenshot) lands when the paste has no text.
                     // Text keeps its HTML (bold, italic, underline) when the host can read it.
                     let html = self.services.clipboard_html.as_mut().and_then(|f| f()).filter(|h| !h.is_empty());

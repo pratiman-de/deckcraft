@@ -2340,6 +2340,48 @@ fn overdue_visible_logic_does_not_reanchor_a_later_hidden_show() {
     assert_eq!(app.show.as_ref().unwrap().state.slide, 1, "time from the full visible frame is preserved through the logic-only pass");
 }
 
+/// Vector art copied in another app (VectorCraft, Illustrator…) arrives as SVG markup in the
+/// plain text: it pastes as one picture at the drawing's size, centred, not as a text box of
+/// markup. Without an SVG renderer it falls back to the picture published alongside it.
+#[test]
+fn pasting_svg_markup_inserts_a_picture() {
+    // 16:9 like the stand-in picture below, so its aspect can't move the frame.
+    let svg = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"192\" height=\"108\" \
+               viewBox=\"0 0 192 108\"><rect width=\"192\" height=\"108\" fill=\"#F07B5A\"/></svg>\n";
+    for with_renderer in [true, false] {
+        let session = Session::with_new();
+        let png = {
+            let d = session.active().unwrap();
+            deckcraft_engine::cmd::file::render_png(&d.doc, 0, 0.1, false).0
+        };
+        let image = png.clone();
+        let mut services = Services { clipboard_image: Some(Box::new(move || Some(image.clone()))), ..Default::default() };
+        if with_renderer {
+            services.clipboard_svg = Some(Box::new(move |_: &str| Some((png.clone(), 192.0, 108.0))));
+        }
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+            |ui, app: &mut SlideApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            SlideApp::new(session, services),
+        );
+        harness.run_steps(2);
+        let before = harness.state().session.active().unwrap().doc.slides[0].shapes.len();
+        harness.event(egui::Event::Paste(svg.into()));
+        harness.run_steps(2);
+        let d = harness.state().session.active().unwrap();
+        let shapes = &d.doc.slides[0].shapes;
+        assert_eq!(shapes.len(), before + 1, "one new shape (renderer: {with_renderer})");
+        let pic = shapes.last().unwrap();
+        assert!(matches!(pic.kind, deckcraft_model::ShapeKind::Picture { .. }), "a picture, not a text box (renderer: {with_renderer})");
+        let x = pic.xfrm.as_ref().unwrap();
+        let (sw, sh) = (d.doc.slide_size.width, d.doc.slide_size.height);
+        assert!((x.w - 192.0).abs() < 0.01 && (x.h - 108.0).abs() < 0.01, "size {x:?}");
+        assert!((x.x - (sw - 192.0) / 2.0).abs() < 0.01 && (x.y - (sh - 108.0) / 2.0).abs() < 0.01, "centred {x:?}");
+    }
+}
+
 /// An empty text box went out as HTML with empty plain text, so egui-winit dropped Ctrl+V and
 /// the shortcut pasted nothing (the context menu worked). It now leaves the marker like any
 /// object without words.
