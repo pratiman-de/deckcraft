@@ -49,9 +49,13 @@ pub fn svg_png(svg: &str) -> Option<(Vec<u8>, f64, f64)> {
         // Sizes come back in points: `width="1in"` is 72, not usvg's 96-dpi default.
         dpi: 72.0,
         // Pasted markup is untrusted: an `<image href="…">` must never read a local file, which
-        // usvg's default resolver does. Data URLs still work; any other reference resolves to nothing.
+        // usvg's default resolver does. Data URLs still work, within the pixel budget; any other
+        // reference resolves to nothing.
         image_href_resolver: resvg::usvg::ImageHrefResolver {
-            resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_data: Box::new(|mime, data, opts| {
+                let resolve = resvg::usvg::ImageHrefResolver::default_data_resolver();
+                if embedded_image_fits(mime, &data) { resolve(mime, data, opts) } else { None }
+            }),
             resolve_string: Box::new(|_, _| None),
         },
         ..Default::default()
@@ -66,6 +70,21 @@ pub fn svg_png(svg: &str) -> Option<(Vec<u8>, f64, f64)> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new((w * scale).ceil() as u32, (h * scale).ceil() as u32)?;
     resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale as f32, scale as f32), &mut pixmap.as_mut());
     Some((pixmap.encode_png().ok()?, w, h))
+}
+
+/// Whether an embedded raster (`<image href="data:…">`) may be decoded: its header must declare at
+/// most [`SVG_MAX_PIXELS`]. resvg decodes an embedded picture at its declared size before any
+/// render-size cap applies, so a small file claiming a huge size would allocate gigabytes. A nested
+/// SVG is parsed, not decoded, and goes through.
+fn embedded_image_fits(mime: &str, data: &[u8]) -> bool {
+    if mime.contains("svg") {
+        return true;
+    }
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .is_some_and(|(w, h)| f64::from(w) * f64::from(h) <= SVG_MAX_PIXELS)
 }
 
 #[cfg(test)]
@@ -102,6 +121,56 @@ mod tests {
         let (png, _, _) = super::svg_png(file).expect("render");
         let img = image::load_from_memory(&png).expect("decode").to_rgba8();
         assert_eq!(img.get_pixel(8, 8)[3], 0, "nothing drawn from a local path");
+    }
+
+    /// A PNG chunk: length, type, data, CRC.
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut crc = 0xFFFF_FFFFu32;
+        for b in kind.iter().chain(data) {
+            crc ^= u32::from(*b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        let mut out = (data.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&(crc ^ 0xFFFF_FFFF).to_be_bytes());
+        out
+    }
+
+    /// An embedded picture within the pixel budget is drawn; a tiny PNG whose header declares a
+    /// huge size is dropped before anything is allocated for it, and the drawing still renders.
+    #[test]
+    fn embedded_pictures_are_bounded_by_their_declared_size() {
+        let svg_with = |png: &[u8]| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4" height="4"><image xlink:href="data:image/png;base64,{}" width="4" height="4"/></svg>"##,
+                deckcraft_engine::cmd::base64_encode(png)
+            )
+        };
+        let mut small = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut small), image::ImageFormat::Png)
+            .expect("encode");
+        let (png, _, _) = super::svg_png(&svg_with(&small)).expect("render");
+        let img = image::load_from_memory(&png).expect("decode").to_rgba8();
+        let p = img.get_pixel(8, 8);
+        assert!(p[0] > 200 && p[3] > 200, "the small picture is drawn: {p:?}");
+
+        // 40000 x 40000 declared (1.6 gigapixels) in a few dozen bytes.
+        let mut ihdr = 40_000u32.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&40_000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut bomb = b"\x89PNG\r\n\x1a\n".to_vec();
+        bomb.extend(png_chunk(b"IHDR", &ihdr));
+        bomb.extend(png_chunk(b"IDAT", &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01]));
+        bomb.extend(png_chunk(b"IEND", &[]));
+        assert!(!super::embedded_image_fits("image/png", &bomb));
+        assert!(super::embedded_image_fits("image/png", &small));
+        let (png, _, _) = super::svg_png(&svg_with(&bomb)).expect("render");
+        let img = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!(img.get_pixel(8, 8)[3], 0, "the oversized picture is dropped");
     }
 
     /// Puts HTML and a 1×1 picture on the macOS pasteboard and reads them back.
